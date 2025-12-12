@@ -137,7 +137,7 @@ class BehaviorService:
         self.session_key_prefix = settings.BEHAVIOR_SESSION_REDIS_KEY.rstrip(":")
         ttl_candidate = int(settings.BEHAVIOR_SESSION_TTL_SECONDS)
         self.session_ttl = ttl_candidate or settings.EXPIRE_DAY * 86400
-        self.history_key = settings.BEHAVIOR_EVENT_FAILURE_QUEUE
+        self.history_key_prefix = settings.BEHAVIOR_EVENT_FAILURE_QUEUE.rstrip(":")
         self.history_ttl = getattr(settings, "BEHAVIOR_FAILURE_TTL_SECONDS", 604800)
 
     def _get_lock(self, camera_id: str) -> asyncio.Lock:
@@ -208,7 +208,6 @@ class BehaviorService:
                 "camera_id": camera_id,
                 "complete": complete,
                 "reason": reason,
-                "final_video": None,
                 "pending_clips": pending,
                 "actions": [a.to_dict() for a in actions],
                 "segments": [seg.to_summary() for seg in (event_segments or [])],
@@ -228,11 +227,8 @@ class BehaviorService:
                     reason,
                     [seg.to_summary() for seg in session.pending_segments],
                 )
-            if complete and event_segments:
-                await self._record_event_history(camera_id, "complete", reason, event_segments)
-                await self._notify_complete_event(result)
-            elif cleared_snapshot:
-                await self._record_event_history(camera_id, "cleared", reason, cleared_snapshot)
+            if cleared_snapshot:
+                await self._record_session_history(camera_id, "cleared", reason, cleared_snapshot)
             await self._persist_session(camera_id, session)
             return result
 
@@ -477,7 +473,7 @@ class BehaviorService:
             logger.debug("无法解析 clip_time：%s", value)
             return None
 
-    async def _record_event_history(
+    async def _record_session_history(
         self,
         camera_id: str,
         status: str,
@@ -495,30 +491,18 @@ class BehaviorService:
         }
         data = json.dumps(payload, ensure_ascii=False)
         try:
-            await self.redis_client.lpush(self.history_key, data)
-            await self.redis_client.expire(self.history_key, self.history_ttl)
+            redis_key = self._history_key(status)
+            await self.redis_client.lpush(redis_key, data)
+            await self.redis_client.expire(redis_key, self.history_ttl)
+            logger.info(
+                "行为识别：记录事件历史 camera=%s status=%s redis_key=%s",
+                camera_id,
+                status,
+                redis_key,
+            )
         except Exception:
             logger.exception("记录事件历史失败 camera=%s", camera_id)
 
-    async def _notify_complete_event(self, event_payload: Dict[str, Any]):
-        """将完整事件推送到外部系统（如未配置 URL 则直接返回）。"""
-        if not settings.BEHAVIOR_EVENT_NOTIFY_URL:
-            return
-        payload = {
-            "camera_id": event_payload.get("camera_id"),
-            "reason": event_payload.get("reason"),
-            "segments": event_payload.get("segments"),
-            "pending_clips": event_payload.get("pending_clips"),
-            "raw": event_payload.get("raw"),
-        }
-        try:
-            logger.info(
-                "行为识别：模拟推送事件到 %s payload=%s",
-                settings.BEHAVIOR_EVENT_NOTIFY_URL,
-                payload,
-            )
-            # TODO: 实际对接时可启用 HTTP 请求
-            # async with httpx.AsyncClient(timeout=10) as client:
-            #     await client.post(settings.BEHAVIOR_EVENT_NOTIFY_URL, json=payload)
-        except Exception:
-            logger.exception("行为识别：推送事件失败 camera=%s", payload.get("camera_id"))
+    def _history_key(self, status: str) -> str:
+        prefix = self.history_key_prefix or settings.BEHAVIOR_EVENT_FAILURE_QUEUE
+        return f"{prefix}:{status}"

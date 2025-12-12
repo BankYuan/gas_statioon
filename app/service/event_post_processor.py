@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from app.config import settings
 from app.database import async_session
 from app.models.behavior_event import BehaviorEvent
@@ -23,6 +25,8 @@ class EventPostProcessor:
         self.max_attempts = max(1, settings.BEHAVIOR_EVENT_MAX_RETRIES)
         self.retry_backoff = max(0.5, settings.BEHAVIOR_EVENT_RETRY_BACKOFF)
         self.download_retries = max(1, settings.BEHAVIOR_EVENT_DOWNLOAD_RETRIES)
+        self.history_key_prefix = settings.BEHAVIOR_EVENT_FAILURE_QUEUE.rstrip(":")
+        self.history_ttl = getattr(settings, "BEHAVIOR_FAILURE_TTL_SECONDS", 604800)
 
     async def process_event(self, event_result: Dict[str, Any]):
         segments = event_result.get("segments") or []
@@ -31,6 +35,7 @@ class EventPostProcessor:
         camera_id = event_result.get("camera_id", "unknown")
         start_time = segments[0].get("clip_time")
         end_time = segments[-1].get("clip_time")
+        reason = event_result.get("reason", "ok")
         logger.info(
             "事件后处理：准备拼接 camera=%s segments=%d start=%s end=%s",
             camera_id,
@@ -42,7 +47,14 @@ class EventPostProcessor:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_attempts + 1):
             try:
-                await self._process_once(camera_id, start_time, end_time, segments)
+                video_object, video_url = await self._process_once(camera_id, start_time, end_time, segments)
+                await self._record_success(
+                    camera_id=camera_id,
+                    reason=reason,
+                    segments=segments,
+                    video_object=video_object,
+                    video_url=video_url,
+                )
                 return
             except Exception as exc:
                 last_exc = exc
@@ -82,6 +94,7 @@ class EventPostProcessor:
                 video_url=video_url,
                 segments=segments,
             )
+            return video_object, video_url
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -216,21 +229,122 @@ class EventPostProcessor:
         )
 
     async def _record_failure(self, event_result: Dict[str, Any], exc: Optional[Exception]):
+        status = "postprocess_failed"
         payload = {
             "error": str(exc) if exc else "unknown",
             "event": event_result,
             "timestamp": time.time(),
+            "status": status,
         }
         data = json.dumps(payload, ensure_ascii=False, default=str)
         if not self.redis_client:
             logger.error("事件后处理失败，未写入失败队列：%s", data)
             return
         try:
-            await self.redis_client.lpush(settings.BEHAVIOR_EVENT_FAILURE_QUEUE, data)
+            redis_key = self._history_key(status)
+            await self.redis_client.lpush(redis_key, data)
+            await self.redis_client.expire(redis_key, self.history_ttl)
             logger.error(
                 "事件后处理失败，已写入失败队列=%s camera=%s",
-                settings.BEHAVIOR_EVENT_FAILURE_QUEUE,
+                redis_key,
                 event_result.get("camera_id"),
             )
         except Exception:
             logger.exception("写入事件失败队列失败 payload=%s", data)
+
+    async def _record_success(
+        self,
+        *,
+        camera_id: str,
+        reason: str,
+        segments: List[Dict[str, Any]],
+        video_object: str,
+        video_url: str,
+    ):
+        await self._record_history(camera_id, "complete", reason, segments, video_object, video_url)
+        notify_ok = await self._notify_complete_event(
+            camera_id,
+            reason,
+            segments,
+            video_object,
+            video_url,
+        )
+        if not notify_ok:
+            logger.warning(
+                "事件通知仍失败 camera=%s video=%s，已记录 notify_failed",
+                camera_id,
+                video_object,
+            )
+
+    async def _record_history(
+        self,
+        camera_id: str,
+        status: str,
+        reason: str,
+        segments: List[Dict[str, Any]],
+        video_object: str,
+        video_url: str,
+    ):
+        if not self.redis_client:
+            return
+        payload = {
+            "camera_id": camera_id,
+            "status": status,
+            "reason": reason,
+            "segments": segments,
+            "video_object": video_object,
+            "video_url": video_url,
+            "timestamp": time.time(),
+        }
+        data = json.dumps(payload, ensure_ascii=False, default=str)
+        try:
+            redis_key = self._history_key(status)
+            await self.redis_client.lpush(redis_key, data)
+            await self.redis_client.expire(redis_key, self.history_ttl)
+            logger.info("事件历史已记录 camera=%s status=%s redis_key=%s", camera_id, status, redis_key)
+        except Exception:
+            logger.exception("写入事件历史失败 camera=%s", camera_id)
+
+    async def _notify_complete_event(
+        self,
+        camera_id: str,
+        reason: str,
+        segments: List[Dict[str, Any]],
+        video_object: str,
+        video_url: str,
+    ) -> bool:
+        notify_url = settings.BEHAVIOR_EVENT_NOTIFY_URL
+        if not notify_url:
+            return True
+        payload = {
+            "camera_id": camera_id,
+            "reason": reason,
+            "video_object": video_object,
+            "video_url": video_url,
+            "segments": segments,
+        }
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, settings.BEHAVIOR_EVENT_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(notify_url, json=payload)
+                logger.info("事件通知已发送 camera=%s attempt=%s", camera_id, attempt)
+                return True
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "事件通知发送失败 camera=%s attempt=%s/%s error=%s",
+                    camera_id,
+                    attempt,
+                    settings.BEHAVIOR_EVENT_MAX_RETRIES,
+                    exc,
+                )
+                await asyncio.sleep(self.retry_backoff * attempt)
+        await self._record_history(camera_id, "notify_failed", reason, segments, video_object, video_url)
+        if last_exc:
+            logger.error("事件通知彻底失败 camera=%s error=%s", camera_id, last_exc)
+        return False
+
+    def _history_key(self, status: str) -> str:
+        prefix = self.history_key_prefix or settings.BEHAVIOR_EVENT_FAILURE_QUEUE
+        return f"{prefix}:{status}"

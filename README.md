@@ -9,8 +9,8 @@
 - **摄像头与快照管理**：`/camera`、`/snapshot` API 完成摄像头 CRUD、ZLM 控制、抓图上传。
 - **本地 Watchdog**：实时监听 `settings.LOCAL_VIDEO_PATH`，过滤临时文件后上传到 MinIO，并将对象信息写入 Redis 队列。
 - **行为识别管线**：`BehaviorService` 对每段切片调用算法服务，凭动作数据拼接提枪→挂枪事件；`EventPostProcessor` 拼接视频、上传事件桶并写入数据库。
-- **会话持久化 & 历史追溯**：每个摄像头的 Session 保存在 Redis `behavior:sessions:{camera_id}`；完成或清空的事件追加到 `behavior:event_failures`，默认保留 7 天。
-- **事件通知**：预留 `BEHAVIOR_EVENT_NOTIFY_URL`，可对接外部 HTTP 接口推送识别结果（当前默认打印日志）。
+- **会话持久化 & 历史追溯**：每个摄像头的 Session 保存在 Redis `behavior:sessions:{camera_id}`；完成/清空/通知失败/后处理失败事件分别写入 `behavior:event_failures:<status>`，默认保留 7 天，便于按状态排查。
+- **事件通知**：配置 `BEHAVIOR_EVENT_NOTIFY_URL` 后，将以 HTTP POST 推送事件结果，并带指数退避重试；失败会写入 Redis 历史队列以便补偿。
 - **任务队列**：自研 `RedisQueueService` + dispatcher + worker pool，实现多摄像头并行、同摄像头串行的消费模型。
 - **外部集成**：封装 MinIO 生命周期管理、ZLM API 操作、PostgreSQL ORM。
 
@@ -26,19 +26,18 @@ Camera RTSP
   │ 上传至 MinIO camera-video
   └─> Redis video_tasks（包含 clip_time / service_name）
 
-Redis Dispatcher（BLPOP）
-  └─> asyncio.Queue
-       └─ Workers：
-            1. 下载 MinIO 切片到临时文件
-            2. BehaviorService.process_clip
-                 - 单段调用算法 → SegmentResult
-                 - per-camera Session（asyncio.Lock + Redis）拼接事件
-                 - 中间/完整事件写入 behavior:event_failures（保留 7 天）
-            3. 事件完成 → EventPostProcessor
-                 - 下载并 concat 视频
-                 - 上传 camera-event-video 桶
-                 - 写入 behavior_events 表
-                 - 可选：通知 BEHAVIOR_EVENT_NOTIFY_URL
+Redis Dispatcher（单协程 BLPOP 出队）
+  ├─ 将任务投递到 asyncio.Queue（容量可控，负责“一个出队，多 worker 消费”）
+  └─ 并发 Workers（数量由配置指定，多线程/协程并发）：
+        1. 从本地缓存/MinIO 下载切片到临时文件
+        2. 调用 BehaviorService.process_clip
+             - 单段调用算法 → SegmentResult
+             - 按摄像头加锁（asyncio.Lock）+ Redis Session 续命，实现同摄像头串行、不同摄像头并行
+             - 根据结果更新 Redis `behavior:sessions:*`，并在完成/清空时写入 `behavior:event_failures:<status>`
+        3. 一旦判定提枪→挂枪完整 → 交给 EventPostProcessor
+             - 顺序下载并 concat 视频（ffmpeg）
+             - 上传到 camera-event-video 桶，并写入 PostgreSQL `behavior_events`
+             - 调用 BEHAVIOR_EVENT_NOTIFY_URL（带重试），失败则写入 `behavior:event_failures:notify_failed`
 ```
 
 ---
@@ -63,11 +62,11 @@ Redis Dispatcher（BLPOP）
 1. **Python**：建议 3.11+，准备虚拟环境。
 2. **依赖服务**（均可容器化部署）  
    MinIO `127.0.0.1:19000`、ZLMediaKit `http://127.0.0.1:8080/index/api`、PostgreSQL `127.0.0.1:15432`、Redis `127.0.0.1:6378`、行为识别服务 `settings.BEHAVIOR_SERVICE_URL`。
-3. **安装依赖**
+3. **安装依赖**（已整理在 `requirements.txt`）
    ```bash
-   pip install fastapi uvicorn[standard] sqlalchemy[asyncio] asyncpg \
-              httpx redis watchdog minio pydantic-settings python-dotenv
+   pip install -r requirements.txt
    ```
+   其中涵盖 FastAPI、SQLAlchemy、MinIO、Redis、Watchdog、PyCryptodome 等核心组件，便于一键安装。
 4. **配置**：创建 `.env` 并覆写 `app/config.py` 默认值（如 `MINIO_ENDPOINT`、`REDIS_URL`、`BEHAVIOR_SESSION_TTL_SECONDS` 等）。
 5. **数据库初始化**
    ```bash
@@ -100,29 +99,48 @@ python scripts/consumer_worker.py
 
 | 类型 | 内容 | 查看方式（使用默认配置即可在当前服务器执行） |
 | --- | --- | --- |
-| Redis `video_tasks` | 待消费任务 | `redis-cli -h 127.0.0.1 -p 6378 LRANGE video_tasks 0 -1` |
-| Redis `behavior:sessions` | 各摄像头 Session | `redis-cli -h 127.0.0.1 -p 6378 HKEYS behavior:sessions`<br>`redis-cli -h 127.0.0.1 -p 6378 HGET behavior:sessions camera_51018500451327700007` |
-| Redis `behavior:event_failures` | 完成/清空事件历史（7 天） | `redis-cli -h 127.0.0.1 -p 6378 LRANGE behavior:event_failures 0 20` |
-| PostgreSQL `cameras`、`behavior_events` | 摄像头/事件记录 | `psql -h 127.0.0.1 -p 15432 -U video_user -d video_db` 然后 `SELECT * FROM cameras LIMIT 5;`、`SELECT id,camera_id,start_clip_time,end_clip_time,video_object FROM behavior_events ORDER BY id DESC LIMIT 10;` |
-| MinIO `camera-video` | Watchdog 上传的原始切片 | 控制台 http://127.0.0.1:19000 或 `mc alias set local http://127.0.0.1:19000 minioadmin minioadmin`，再 `mc ls local/camera-video/videos/` |
-| MinIO `camera-event-video` | 事件拼接结果 | `mc ls local/camera-event-video/events/` |
+| Redis `video_tasks` | 待消费任务（Watchdog 上传新切片时会追加） | `redis-cli -h 127.0.0.1 -p 6378 LRANGE video_tasks 0 -1` |
+| Redis `behavior:sessions` | 各摄像头 Session（哈希或独立 key，默认 `behavior:sessions:{camera_id}`；只有累积到切片时才有值） | `redis-cli -h 127.0.0.1 -p 6378 HKEYS behavior:sessions`<br>`redis-cli -h 127.0.0.1 -p 6378 HGET behavior:sessions camera_51018500451327700007`<br>`redis-cli -h 127.0.0.1 -p 6378 GET behavior:sessions:camera_51018500451327700007` |
+| Redis `behavior:event_failures:*` | 完整/清空/通知失败/拼接失败事件历史（7 天；`complete` / `cleared` / `notify_failed` / `postprocess_failed`）<br>只有触发相应动作时才会出现记录 | - 完整事件：`redis-cli -h 127.0.0.1 -p 6378 LRANGE behavior:event_failures:complete 0 20`（当提枪→挂枪流程走完时生成）<br>- 清空快照：`redis-cli -h 127.0.0.1 -p 6378 LRANGE behavior:event_failures:cleared 0 20`（事件因段数超限被放弃时生成）<br>- 通知失败：`redis-cli -h 127.0.0.1 -p 6378 LRANGE behavior:event_failures:notify_failed 0 20`（HTTP 通知多次重试仍失败）<br>- 后处理失败：`redis-cli -h 127.0.0.1 -p 6378 LRANGE behavior:event_failures:postprocess_failed 0 20`（拼接/上传/写库出错且用尽重试） |
+| PostgreSQL `cameras`、`behavior_events` | 摄像头/事件记录（`behavior_events` 在后处理成功后才有新行） | `psql -h 127.0.0.1 -p 15432 -U video_user -d video_db` 然后 `SELECT * FROM cameras LIMIT 5;`、`SELECT id,camera_id,start_clip_time,end_clip_time,video_object FROM behavior_events ORDER BY id DESC LIMIT 10;` |
+| MinIO `camera-video` | Watchdog 上传的原始切片（只有 ZLM 持续输出时才有新增） | 控制台 http://127.0.0.1:19000 或 `mc alias set local http://127.0.0.1:19000 minioadmin minioadmin`，再 `mc ls local/camera-video/videos/` |
+| MinIO `camera-event-video` | 事件拼接结果（事件完成且后处理成功后新增） | `mc ls local/camera-event-video/events/` |
 
 ---
 
 ## 7. 常用运维命令
 
+### 7.1 队列 / 存储
 - **检查生命周期配置**：`python scripts/minio_lifecycleconfig.py`
-- **调试 ZLM 接口**：`uvicorn api_manage:app --reload` 后访问 `/add_stream_proxy`、`/getSnap` 等
-- **监控队列长度**：`redis-cli -h 127.0.0.1 -p 6378 LLEN video_tasks`
-- **下载/查看事件视频**：`mc cp local/camera-event-video/events/<camera>/<ts>.mp4 ./`
+- **监控 Redis 队列长度**：`redis-cli -h 127.0.0.1 -p 6378 LLEN video_tasks`
+- **下载事件视频**：`mc cp local/camera-event-video/events/<camera>/<ts>.mp4 ./`
+
+### 7.2 摄像头管理（FastAPI）
+| 目的 | 命令 | 说明 / 输出示例 |
+| --- | --- | --- |
+| 新增摄像头 | ```bash<br>curl -X POST http://127.0.0.1:8000/camera/add \ <br>  -H "Content-Type: application/json" \ <br>  -d '{"name":"入口1","rtsp_url":"rtsp://user:pwd@192.168.1.10/stream"}'<br>``` | 返回 `CameraResponse` JSON，包含 `camera_id`、`proxy_url` 等字段。 |
+| 查看摄像头列表 | ```bash<br>curl http://127.0.0.1:8000/camera/list | jq '.'<br>``` | 输出所有摄像头详情，可配合 `jq` 过滤。 |
+| 删除摄像头 | ```bash<br>curl -X DELETE http://127.0.0.1:8000/camera/1<br>``` | 成功返回 `{"message":"Camera deleted"}`。 |
+
+### 7.3 ZLMediaKit 管理
+| 场景 | 命令 | 说明 / 输出 |
+| --- | --- | --- |
+| 启动拉流并自动记录 stream_key | ```bash<br>curl -X POST http://127.0.0.1:8000/camera/1/start<br>``` | 返回 `{"message":"Stream started","camera":{...}}`，其中包含 `stream_key`、`proxy_url`。 |
+| 停止拉流 | ```bash<br>curl -X POST http://127.0.0.1:8000/camera/1/stop<br>``` | 关闭 ZLM 代理，返回状态。 |
+| 获取截图 | ```bash<br>curl http://127.0.0.1:8000/camera/1/snapshot<br>``` | 返回存储路径：`{"file_path":"/mnt/.../20250101_120000.jpg"}`。 |
+| 查询流状态 | ```bash<br>curl http://127.0.0.1:8000/camera/1/status<br>``` | 输出 `{"online":true,"stream":"camera_1"}`；若未启动则提示错误。 |
+| 同步 ZLM → 数据库 | ```bash<br>curl -X POST http://127.0.0.1:8000/camera/sync<br>``` | 拉取 ZLM `media/list` 与本地摄像头比对，返回新建/删除数量。 |
+
+> 若需直接调试 ZLM 原生 API，可运行 `uvicorn api_manage:app --reload`，并使用 `curl http://127.0.0.1:8001/add_stream_proxy?...` 之类命令验证。
 
 ---
 
 ## 8. 开发提示
 
 - 日志由 `app/utils/logger.py` 统一初始化，`LOG_LEVEL=DEBUG` 可输出 Watchdog/行为识别的细节日志。
-- `BehaviorService` 只负责动作拼接，事件完成后交由 `EventPostProcessor` 下载、拼接、上传、写库；可通过自定义 `BEHAVIOR_EVENT_NOTIFY_URL` 对接告警系统。
-- `behavior:event_failures` 里的历史记录可被后台任务消费落库，保证追溯。
+- `BehaviorService` 只负责动作拼接，事件完成后交由 `EventPostProcessor` 下载、拼接、上传、写库；`BEHAVIOR_EVENT_NOTIFY_URL` 默认执行 HTTP POST 并带重试，结果也写入 Redis 历史。
+- 事件拼接的最终视频可通过 PostgreSQL `behavior_events.video_object/video_url` 查询，或读取通知 payload/Redis 历史记录快速定位。
+- Redis 历史按状态拆分在 `behavior:event_failures:<status>`（complete/cleared/notify_failed/postprocess_failed），方便定向排查；可按需新增消费者对这些 key 做离线同步。
 - Watchdog `Observer` 会在 FastAPI 关闭事件中停止，如需独立运行可手动调用 `start_watching`。
 
 ---

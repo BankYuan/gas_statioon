@@ -1,0 +1,27 @@
+# Python cache / venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Local data & video artifacts
+save_data/
+*.mp4
+*.log
+*.tmp
+
+# Secrets / configs
+.env
+.env.*
+
+# OS junk
+.DS_Store
+Thumbs.db
