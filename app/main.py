@@ -48,9 +48,9 @@ async def startup_event():
 
     app_.state.zlm_service = ZLMService()
     app_.state.camera_service = CameraService()
-    app_.state.behavior_service = BehaviorService()
     app_.state.redis_service = RedisQueueService()
     await app_.state.redis_service.init()
+    app_.state.behavior_service = BehaviorService(redis_client=app_.state.redis_service.client)
 
     logger.info("Services initialized, starting file watcher")
 

@@ -30,12 +30,21 @@ class RedisQueueService:
     async def enqueue_video(self, video_path: str):
         raise NotImplementedError("Use enqueue_minio_video to push MinIO info")
 
-    async def enqueue_minio_video(self, object_name: str, presigned_url: str):
+    async def enqueue_minio_video(
+        self,
+        object_name: str,
+        presigned_url: str,
+        *,
+        service_name: Optional[str] = None,
+        clip_time: Optional[str] = None,
+    ):
         payload = json.dumps(
             {
                 "object_name": object_name,
                 "presigned_url": presigned_url,
                 "timestamp": time.time(),
+                "service_name": service_name,
+                "clip_time": clip_time,
             }
         )
         await self.client.rpush(self.queue_name, payload)

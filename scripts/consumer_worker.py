@@ -12,6 +12,7 @@ from app.config import settings
 from app.service.redis_queue_service import RedisQueueService
 from app.service.minio_service import MinioService
 from app.service.behavior_service import BehaviorService
+from app.service.event_post_processor import EventPostProcessor
 from app.utils.logger import init_logging, get_logger
 from app.video_watcher import start_consumer
 
@@ -22,7 +23,8 @@ async def main():
 
     redis_service = RedisQueueService()
     minio_service = MinioService()
-    behavior_service = BehaviorService()
+    behavior_service = BehaviorService(redis_client=redis_service.client)
+    event_processor = EventPostProcessor(minio_service, redis_service.client)
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, minio_service.init)
@@ -42,7 +44,12 @@ async def main():
             # 部分平台不支持信号处理，忽略
             pass
 
-    consumer_task = await start_consumer(minio_service, behavior_service, redis_service)
+    consumer_task = await start_consumer(
+        minio_service,
+        behavior_service,
+        redis_service,
+        event_processor,
+    )
     logger.info("Redis 消费者已启动")
 
     await stop_event.wait()

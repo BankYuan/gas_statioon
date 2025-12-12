@@ -4,6 +4,8 @@ import tempfile
 import time
 from datetime import timedelta
 from pathlib import Path
+from typing import Set
+
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from app.config import settings
@@ -73,9 +75,12 @@ async def process_and_enqueue(
         finally:
             semaphore.release()
 
+        clip_time = Path(upload_info["object_name"]).stem
         await redis_service.enqueue_minio_video(
             object_name=upload_info["object_name"],
             presigned_url=upload_info["presigned_url"],
+            service_name=settings.BEHAVIOR_SERVICE_NAME,
+            clip_time=clip_time,
         )
         logger.info("✅ 已将 MinIO 对象入队：%s", upload_info["object_name"])
 
@@ -93,27 +98,85 @@ class VideoHandler(FileSystemEventHandler):
         self.minio_service = minio_service
         self.redis_service = redis_service
         self.semaphore = semaphore
+        self._processing: Set[str] = set()
+        self._stabilize_checks = 3
+        self._stabilize_interval = 0.5
 
-    def _process_path(self, path):
-        """通用文件过滤和处理逻辑"""
+    def _is_temp_name(self, filename: str) -> bool:
+        lower = filename.lower()
+        name_wo_ext, _ = os.path.splitext(lower)
+        return (
+            filename.startswith(".")
+            or lower.endswith(".tmp")
+            or lower.endswith(".temp")
+            or ".tmp" in lower
+            or ".temp" in lower
+            or "tmp" in name_wo_ext
+            or "temp" in name_wo_ext
+            or lower.endswith(".partial")
+        )
+
+    def _should_process(self, path: str) -> bool:
+        if not path:
+            return False
+        if not os.path.exists(path) or os.path.isdir(path):
+            return False
         filename = os.path.basename(path)
+        if self._is_temp_name(filename):
+            return False
+        if not filename.lower().endswith(".mp4"):
+            return False
+        return True
 
-        if (not os.path.isdir(path)
-                and path.lower().endswith(".mp4")
-                and not filename.startswith('.')):
+    def _process_path(self, path: str):
+        """校验路径并异步等待文件稳定后入队"""
+        if not self._should_process(path):
+            logger.debug("🚫 过滤临时/非视频/不存在文件: %s", path)
+            return
 
-            self.loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(
-                    process_and_enqueue(
-                        path,
-                        self.minio_service,
-                        self.semaphore,
-                        self.redis_service,
-                    )
-                )
+        abs_path = os.path.abspath(path)
+        if abs_path in self._processing:
+            logger.debug("⚠️ 文件已经在上传队列中，忽略重复事件: %s", abs_path)
+            return
+        self._processing.add(abs_path)
+
+        def _task():
+            asyncio.create_task(self._wait_ready_and_enqueue(abs_path))
+
+        self.loop.call_soon_threadsafe(_task)
+
+    async def _wait_ready_and_enqueue(self, path: str):
+        try:
+            ready = await self._wait_until_stable(path)
+            if not ready:
+                logger.warning("⚠️ 文件始终未稳定，放弃入队: %s", path)
+                return
+            await process_and_enqueue(
+                path,
+                self.minio_service,
+                self.semaphore,
+                self.redis_service,
             )
-        else:
-            logger.debug("🚫 过滤临时文件/非视频文件: %s", path)
+        finally:
+            self._processing.discard(path)
+
+    async def _wait_until_stable(self, path: str) -> bool:
+        prev_size = None
+        for _ in range(self._stabilize_checks):
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return False
+            if size <= 0:
+                await asyncio.sleep(self._stabilize_interval)
+                continue
+            if prev_size is not None and size == prev_size:
+                logger.debug("📁 文件大小稳定，准备上传 %s size=%s", path, size)
+                return True
+            prev_size = size
+            await asyncio.sleep(self._stabilize_interval)
+        logger.warning("⚠️ 文件大小一直变化，判定为不稳定 %s", path)
+        return False
 
     def on_created(self, event):
         """捕获文件创建事件（通常是临时文件创建，会被过滤）"""
@@ -134,64 +197,124 @@ class VideoHandler(FileSystemEventHandler):
 # ============================
 # Redis 队列消费者（手动启动）
 # ============================
-async def redis_consumer(redis_service, minio_service, behavior_service):
+async def redis_consumer(redis_service, minio_service, behavior_service, event_processor=None):
     """
-    阻塞等待 Redis 队列的 MinIO 对象任务。
-    需按需手动启动：下载 MinIO 对象到本地 → 行为识别/拼接。
+    使用调度器 + 多 worker 的方式消费 Redis 队列，避免单线程瓶颈。
     """
-    logger.info("🚀 Redis 任务消费者已启动")
+    logger.info("🚀 Redis 任务消费者已启动（dispatcher + worker pool）")
+
+    task_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+    async def worker(worker_id: int):
+        try:
+            while True:
+                task = await task_queue.get()
+                try:
+                    await _process_queue_task(
+                        task,
+                        worker_id,
+                        minio_service,
+                        behavior_service,
+                        event_processor,
+                    )
+                finally:
+                    task_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("worker-%s 被取消", worker_id)
+            raise
+
+    async def dispatcher():
+        try:
+            while True:
+                task = await redis_service.dequeue_video()
+                if not task:
+                    continue
+                await task_queue.put(task)
+        except asyncio.CancelledError:
+            logger.info("dispatcher 被取消")
+            raise
+
+    workers = [
+        asyncio.create_task(worker(i), name=f"redis-worker-{i}")
+        for i in range(settings.UPLOAD_CONCURRENCY)
+    ]
+    dispatcher_task = asyncio.create_task(dispatcher(), name="redis-dispatcher")
+
     try:
-        while True:
-            task = await redis_service.dequeue_video()
-            if not task:
-                continue
-
-            object_name = task.get("object_name")
-            presigned_url = task.get("presigned_url")
-
-            if not object_name or not presigned_url:
-                logger.warning("收到无效任务：%s", task)
-                continue
-
-            logger.info("🛰️ 消费 MinIO 任务：%s", object_name)
-            camera_id = next((part for part in Path(object_name).parts if part.startswith("camera_")), None)
-
-            # 下载 MinIO 对象到本地临时文件
-            suffix = Path(object_name).suffix or ".mp4"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp_path = tmp.name
-                print("temp_path:", tmp_path)
-            try:
-                await asyncio.to_thread(
-                    minio_service.client.fget_object,
-                    settings.MINIO_BUCKET,
-                    object_name,
-                    tmp_path,
-                )
-            except Exception as dl_exc:
-                logger.exception("下载 MinIO 对象失败 %s: %s", object_name, dl_exc)
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-                continue
-
-            try:
-                if behavior_service is not None:
-                    await behavior_service.process_clip(tmp_path, camera_id=camera_id)
-            except Exception as proc_exc:
-                logger.exception("行为识别/拼接失败 %s: %s", tmp_path, proc_exc)
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+        await asyncio.gather(dispatcher_task, *workers)
     except asyncio.CancelledError:
+        dispatcher_task.cancel()
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(dispatcher_task, *workers, return_exceptions=True)
         logger.info("Redis 任务消费者被取消，准备退出")
         raise
     except Exception:
         logger.exception("Redis 任务消费者异常退出")
+        dispatcher_task.cancel()
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(dispatcher_task, *workers, return_exceptions=True)
         raise
+
+
+async def _process_queue_task(
+    task,
+    worker_id: int,
+    minio_service,
+    behavior_service,
+    event_processor,
+):
+    object_name = task.get("object_name")
+    presigned_url = task.get("presigned_url")
+
+    if not object_name or not presigned_url:
+        logger.warning("worker-%s 收到无效任务：%s", worker_id, task)
+        return
+
+    logger.info("🛰️ worker-%s 消费 MinIO 任务：%s", worker_id, object_name)
+    camera_id = next((part for part in Path(object_name).parts if part.startswith("camera_")), None)
+    clip_time = task.get("clip_time")
+    service_name = task.get("service_name")
+
+    suffix = Path(object_name).suffix or ".mp4"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp_path = tmp.name
+    try:
+        await asyncio.to_thread(
+            minio_service.client.fget_object,
+            settings.MINIO_BUCKET,
+            object_name,
+            tmp_path,
+        )
+    except Exception as dl_exc:
+        logger.exception("下载 MinIO 对象失败 %s: %s", object_name, dl_exc)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return
+
+    try:
+        result = None
+        if behavior_service is not None:
+            result = await behavior_service.process_clip(
+                tmp_path,
+                camera_id=camera_id,
+                object_name=object_name,
+                clip_time=clip_time,
+                service_name=service_name,
+            )
+            if result.get("complete") and event_processor is not None:
+                await event_processor.process_event(result)
+                logger.info("事件后处理完成 camera=%s", result.get("camera_id"))
+    except Exception as proc_exc:
+        logger.exception("行为识别失败 %s: %s", tmp_path, proc_exc)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 # ============================
@@ -213,8 +336,7 @@ async def start_watching(loop, minio_service, redis_service):
 # ============================
 # 手动启动消费者
 # ============================
-async def start_consumer(minio_service, behavior_service, redis_service):
-    consumer_task = asyncio.create_task(
-        redis_consumer(redis_service, minio_service, behavior_service)
+async def start_consumer(minio_service, behavior_service, redis_service, event_processor=None):
+    return asyncio.create_task(
+        redis_consumer(redis_service, minio_service, behavior_service, event_processor)
     )
-    return consumer_task
