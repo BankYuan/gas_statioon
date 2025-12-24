@@ -6,15 +6,14 @@ from Crypto.Random import get_random_bytes
 import json
 
 
-def get_container_id():
+def get_container_id_by_name(name: str):
     try:
         cid = subprocess.check_output(
-            "cat /proc/self/cgroup | grep 'docker' | sed 's/^.*\\///'",
-            shell=True
+            ["docker", "ps", "-q", "--filter", f"name=^{name}$"]
         )
-        return cid.decode().strip()[:12]
-    except:
-        return "unknown_container"
+        return cid.decode().strip()
+    except Exception:
+        return None
 
 
 def get_mainboard_serial():
@@ -46,9 +45,9 @@ def aes_encrypt(key, text):
 
 
 if __name__ == "__main__":
-    password = "my_password"   # 自设密码
+    password = "cddx_gas"   # 自设密码
     info = {
-        "container_id": get_container_id(),
+        "container_id": "fa3de67218b7", #get_container_id_by_name("minio"),
         "mainboard": get_mainboard_serial()
     }
 

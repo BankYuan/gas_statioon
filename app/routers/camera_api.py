@@ -1,6 +1,6 @@
 # app/routers/camera_api.py
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 import os
@@ -10,6 +10,12 @@ from app.schemas.camera import CameraCreate, CameraResponse
 from app.models.camera import Camera
 
 router = APIRouter(prefix="/camera", tags=["Camera"])
+
+
+def verify_api_token(x_api_token: str = Header(None)):
+    required = settings.API_TOKEN
+    if required and x_api_token != required:
+        raise HTTPException(status_code=401, detail="Invalid API token")
 
 
 def get_minio_service(request: Request):
@@ -24,7 +30,7 @@ def get_camera_service(request: Request):
     return request.app.state.camera_service
 
 
-@router.post("/add", response_model=CameraResponse)
+@router.post("/add", response_model=CameraResponse, dependencies=[Depends(verify_api_token)])
 async def add_camera(data: CameraCreate, db: AsyncSession = Depends(get_db), camera_service=Depends(get_camera_service)):
     # print(data)
     camera = await camera_service.add_camera(db, data)
@@ -60,7 +66,7 @@ async def delete_camera(camera_id: str, db: AsyncSession = Depends(get_db), came
 #      ZLM 绑定业务部分
 # -----------------------------
 
-@router.post("/{camera_id}/start")
+@router.post("/{camera_id}/start", dependencies=[Depends(verify_api_token)])
 async def start_stream(camera_id: str, db: AsyncSession = Depends(get_db), camera_service=Depends(get_camera_service), zlm_service=Depends(get_zlm_service)):
     """
     为摄像头开启 ZLM 拉流
@@ -103,13 +109,11 @@ async def start_stream(camera_id: str, db: AsyncSession = Depends(get_db), camer
     return {"message": "Stream started", "camera": {
         "id": camera.id,
         "stream": camera.stream,
-        "stream_key": camera.stream_key,
-        "proxy_url": camera.proxy_url,
         "is_pulled": camera.is_pulled
     }}
 
 
-@router.post("/{camera_id}/stop")
+@router.post("/{camera_id}/stop", dependencies=[Depends(verify_api_token)])
 async def stop_stream(camera_id: str, db: AsyncSession = Depends(get_db), camera_service=Depends(get_camera_service), zlm_service=Depends(get_zlm_service)):
     # 查询摄像头
     camera = await camera_service.get_camera(db, camera_id)
@@ -194,6 +198,15 @@ async def sync_camera(db: AsyncSession = Depends(get_db), zlm_service=Depends(ge
     zlm_list = await zlm_service.get_media_list()
     result = await camera_service.sync_with_zlm(db, zlm_list)
     return result
+
+
+@router.post("/{camera_id}/disable", dependencies=[Depends(verify_api_token)])
+async def disable_algorithm(camera_id: str, db: AsyncSession = Depends(get_db), camera_service=Depends(get_camera_service)):
+    """停用该摄像头的算法服务"""
+    ok = await camera_service.disable_algorithm(db, camera_id)
+    if not ok:
+        raise HTTPException(404, "Camera not found")
+    return {"message": "Algorithm disabled", "camera_id": camera_id}
 
 
 

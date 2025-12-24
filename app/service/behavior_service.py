@@ -8,8 +8,10 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from collections import deque
 
 from app.config import settings
+from app.service.algorithm_registry import AlgorithmTask
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -111,10 +113,10 @@ class ClipSession:
 
 class BehaviorService:
     """
-    管理“行为识别”流程：
-    1. 每段切片单独调用算法
-    2. 根据动作数据拼接提枪→挂枪事件
-    3. 超过最大段数仍无结果时自动重置
+    行为识别调度与拼接的核心服务：
+    - 每段切片调用算法，按摄像头串行，避免乱序。
+    - 依据提枪/挂枪标签拼接完整事件，支持异常分类。
+    - 会话状态与异常历史写入 Redis，便于恢复与排查。
     """
 
     TARGET_LIFT_LABELS = {"提油枪"}
@@ -139,6 +141,15 @@ class BehaviorService:
         self.session_ttl = ttl_candidate or settings.EXPIRE_DAY * 86400
         self.history_key_prefix = settings.BEHAVIOR_EVENT_FAILURE_QUEUE.rstrip(":")
         self.history_ttl = getattr(settings, "BEHAVIOR_FAILURE_TTL_SECONDS", 604800)
+        self.enable_lift_only = bool(getattr(settings, "BEHAVIOR_ENABLE_LIFT_ONLY", True))
+        self.enable_short_hang = bool(getattr(settings, "BEHAVIOR_ENABLE_SHORT_HANG", True))
+        self.enable_hang_only = bool(getattr(settings, "BEHAVIOR_ENABLE_HANG_ONLY", True))
+        self.max_wait_seconds = max(0, int(getattr(settings, "BEHAVIOR_MAX_WAIT_SECONDS", 0)))
+        self.short_hang_threshold = max(
+            0, int(getattr(settings, "BEHAVIOR_SHORT_HANG_THRESHOLD_SECONDS", 0))
+        )
+        self.hang_only_backtrack = max(1, int(getattr(settings, "BEHAVIOR_HANG_ONLY_BACKTRACK_SEGMENTS", 5)))
+        self._recent_segments: Dict[str, deque] = {}
 
     def _get_lock(self, camera_id: str) -> asyncio.Lock:
         if camera_id not in self._locks:
@@ -166,18 +177,29 @@ class BehaviorService:
         object_name: Optional[str] = None,
         clip_time: Optional[str] = None,
         service_name: Optional[str] = None,
+        area2d_pt: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        单段切片处理入口：
+        - 调用算法服务拿到动作列表
+        - 更新摄像头会话，判断是否形成完整/异常事件
+        - 返回当前状态或完成事件摘要
+        """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
 
         camera_id = camera_id or self._extract_camera_id(video_path)
         lock = self._get_lock(camera_id)
+        recent = self._recent_segments.setdefault(
+            camera_id, deque(maxlen=self.hang_only_backtrack)
+        )
 
         async with lock:
             session = await self._get_session(camera_id)
             actions, raw_resp = await self._call_recognition(
                 video_path,
                 service_name or self.service_name,
+                area2d_pt=area2d_pt,
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -200,8 +222,11 @@ class BehaviorService:
                 actions=actions,
                 clip_time=clip_time,
             )
+            recent.append(segment)
 
-            complete, reason, event_segments, cleared_snapshot = self._update_session(session, segment)
+            complete, reason, event_segments, cleared_snapshot = self._update_session(
+                camera_id, session, segment
+            )
             pending = [seg.object_name for seg in session.pending_segments]
 
             result = {
@@ -234,9 +259,16 @@ class BehaviorService:
 
     def _update_session(
         self,
+        camera_id: str,
         session: ClipSession,
         segment: SegmentResult,
     ) -> Tuple[bool, str, Optional[List[SegmentResult]], Optional[List[SegmentResult]]]:
+        """
+        核心状态机：
+        - 识别提枪/挂枪并更新会话
+        - 分类返回 ok/short_hang/lift_only/hang_only 等事件
+        - 保护段数/时间上限，必要时清空会话
+        """
         segment_ts = self._clip_timestamp(segment.clip_time)
         actions_sorted = sorted(segment.actions, key=lambda a: a.start_time)
         lifts = [a for a in actions_sorted if self._normalize_label(a.label_name) in self._lift_labels]
@@ -267,10 +299,23 @@ class BehaviorService:
             if not session.pending_segments or session.pending_segments[-1] is not segment:
                 session.pending_segments.append(segment)
 
+        def _has_hang(seg: SegmentResult) -> bool:
+            return any(self._normalize_label(a.label_name) in self._hang_labels for a in seg.actions)
+        def _has_lift(seg: SegmentResult) -> bool:
+            return any(self._normalize_label(a.label_name) in self._lift_labels for a in seg.actions)
+
         if session.start_action is None:
             if lifts:
                 start_new_event(lifts[0])
                 reason = "waiting_hang"
+            elif hangs and self.enable_hang_only:
+                history = self._recent_segments.get(camera_id) or deque(maxlen=self.hang_only_backtrack)
+                # 仅当最近窗口内不存在提枪动作时，才认为是挂枪异常
+                if len(history) >= self.hang_only_backtrack and not any(_has_lift(seg) for seg in history):
+                    filtered = [seg for seg in history if _has_hang(seg)]
+                    # 如果过滤后为空，至少包含当前段
+                    event_segments = filtered if filtered else [segment]
+                    reason = "hang_only"
         else:
             append_segment()
             logger.debug(
@@ -282,6 +327,11 @@ class BehaviorService:
             if lifts:
                 start_new_event(lifts[-1])
                 reason = "waiting_hang"
+
+        def _calc_duration(h: ActionResult) -> Optional[float]:
+            if session.start_abs_ts is not None and segment_ts is not None:
+                return segment_ts - session.start_abs_ts
+            return h.start_time - session.start_action.start_time if session.start_action else None
 
         if session.start_action and hangs:
             valid_hangs: List[ActionResult] = []
@@ -310,32 +360,64 @@ class BehaviorService:
                     cleared_snapshot = list(session.pending_segments)
                     session.reset()
                 else:
+                    duration = _calc_duration(valid_hangs[0])
+                    if (
+                        self.short_hang_threshold
+                        and duration is not None
+                        and duration < self.short_hang_threshold
+                        and self.enable_short_hang
+                    ):
+                        event_segments = list(session.pending_segments)
+                        session.reset()
+                        reason = "short_hang"
+                        logger.info(
+                            "行为识别：短时挂枪 duration=%.3f segs=%d",
+                            duration,
+                            len(event_segments),
+                        )
+                    else:
+                        event_segments = list(session.pending_segments)
+                        session.reset()
+                        reason = "ok"
+                        logger.info(
+                            "行为识别：提挂完成 segments=%d objects=%s",
+                            segment_count,
+                            [seg.object_name for seg in event_segments],
+                        )
+
+        if session.start_action and not event_segments:
+            # 提枪后等待挂枪的超时/超段数处理
+            wait_expired = False
+            if (
+                self.max_wait_seconds
+                and segment_ts is not None
+                and session.start_abs_ts is not None
+                and (segment_ts - session.start_abs_ts) > self.max_wait_seconds
+            ):
+                wait_expired = True
+            if self.max_segments and len(session.pending_segments) > self.max_segments:
+                wait_expired = True
+
+            if wait_expired:
+                if self.enable_lift_only:
                     event_segments = list(session.pending_segments)
-                    session.reset()
-                    reason = "ok"
+                    reason = "lift_only"
                     logger.info(
-                        "行为识别：提挂完成 segments=%d objects=%s",
-                        segment_count,
+                        "行为识别：提枪未挂枪超时 segments=%d objects=%s",
+                        len(event_segments),
                         [seg.object_name for seg in event_segments],
                     )
-
-        if (
-            session.start_action
-            and self.max_segments
-            and len(session.pending_segments) > self.max_segments
-        ):
-            reason = "max_segments_reached"
-            logger.warning(
-                "行为识别：切片累计超过上限 camera_ts=%s pending=%d limit=%d",
-                session.start_abs_ts,
-                len(session.pending_segments),
-                self.max_segments,
-            )
-            cleared_snapshot = list(session.pending_segments)
-            session.reset()
+                else:
+                    cleared_snapshot = list(session.pending_segments)
+                    reason = "max_segments_reached"
+                session.reset()
 
         if not session.start_action and not event_segments:
             session.pending_segments.clear()
+
+        # 事件结束或清空后清理回溯窗口，避免跨事件混入旧片段
+        if event_segments or cleared_snapshot:
+            self._recent_segments.pop(camera_id, None)
 
         if event_segments:
             logger.info(
@@ -350,6 +432,7 @@ class BehaviorService:
         self,
         video_path: str,
         service_name: str,
+        area2d_pt: Optional[str] = None,
     ) -> Tuple[List[ActionResult], Dict[str, Any]]:
         payload = {
             "service_name": service_name,
@@ -357,6 +440,8 @@ class BehaviorService:
                 "video": [video_path],
             },
         }
+        if area2d_pt:
+            payload["params"]["area2D_pt"] = [area2d_pt]
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.request_retries + 1):
             try:
@@ -491,7 +576,7 @@ class BehaviorService:
         }
         data = json.dumps(payload, ensure_ascii=False)
         try:
-            redis_key = self._history_key(status)
+            redis_key = self._history_key(status, camera_id=camera_id)
             await self.redis_client.lpush(redis_key, data)
             await self.redis_client.expire(redis_key, self.history_ttl)
             logger.info(
@@ -503,6 +588,21 @@ class BehaviorService:
         except Exception:
             logger.exception("记录事件历史失败 camera=%s", camera_id)
 
-    def _history_key(self, status: str) -> str:
+    def _history_key(self, status: str, camera_id: Optional[str] = None) -> str:
         prefix = self.history_key_prefix or settings.BEHAVIOR_EVENT_FAILURE_QUEUE
+        if getattr(settings, "BEHAVIOR_HISTORY_PER_CAMERA", False) and camera_id:
+            return f"{prefix}:{status}:{camera_id}"
         return f"{prefix}:{status}"
+
+    async def handle(self, task: AlgorithmTask) -> Dict[str, Any]:
+        """
+        适配 AlgorithmRegistry：用统一 task 调用行为识别。
+        """
+        return await self.process_clip(
+            task.video_path,
+            camera_id=task.camera_id,
+            object_name=task.object_name,
+            clip_time=task.clip_time,
+            service_name=task.service_name,
+            area2d_pt=task.area2d_pt,
+        )

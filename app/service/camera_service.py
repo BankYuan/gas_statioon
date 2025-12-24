@@ -17,6 +17,9 @@ class CameraService:
             fps=camera.fps,
             clip_duration=camera.clip_duration,
             camera_id=camera.camera_id,
+            algorithm_capability=camera.algorithm_capability,
+            area2d_pt=camera.area2d_pt,
+            algorithm_enabled=camera.algorithm_enabled,
 
             # 默认信息
             app="live",
@@ -103,6 +106,9 @@ class CameraService:
                 resolution="HD",
                 codec="H265",
                 fps="25",
+                algorithm_capability="unknown",
+                area2d_pt=None,
+                algorithm_enabled=True,
                 is_pulled=True,
                 proxy_url="",  # 可为空
                 app=app,
@@ -130,6 +136,18 @@ class CameraService:
             "added": list(missing),
             "removed": list(extra)
         }
+
+    async def disable_algorithm(self, db: AsyncSession, camera_id: str) -> bool:
+        """停用摄像头算法服务"""
+        result = await db.execute(select(Camera).where(Camera.camera_id == camera_id))
+        camera = result.scalars().first()
+        if not camera:
+            return False
+        camera.algorithm_enabled = False
+        db.add(camera)
+        await db.commit()
+        await db.refresh(camera)
+        return True
 
 
 camera_service = CameraService()

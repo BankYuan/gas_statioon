@@ -4,21 +4,96 @@ import tempfile
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Set
+from typing import Optional, Set
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from app.config import settings
 from app.utils.logger import get_logger
+from app.database import async_session
+from app.models.camera import Camera
+from sqlalchemy import select
+from app.service.algorithm_registry import AlgorithmTask
 
 logger = get_logger(__name__)
+
+# 简单的摄像头能力缓存，减少频繁查询数据库
+_capability_cache = {}
+_CAPABILITY_TTL_SECONDS = 300
+_camera_area_cache = {}
+_CAMERA_AREA_TTL_SECONDS = 300
+
+
+def _normalize_camera_id(camera_id: Optional[str]) -> Optional[str]:
+    if not camera_id:
+        return None
+    return camera_id.replace("camera_", "", 1) if camera_id.startswith("camera_") else camera_id
+
+
+def _extract_camera_id_from_path(path: str) -> Optional[str]:
+    parts = Path(path).parts
+    for part in parts:
+        if part.startswith("camera_"):
+            return part
+    return None
+
+
+async def _get_camera_capability(camera_id: Optional[str]) -> Optional[str]:
+    camera_id = _normalize_camera_id(camera_id)
+    if not camera_id:
+        return None
+
+    cached = _capability_cache.get(camera_id)
+    now = time.time()
+    if cached and now - cached[1] < _CAPABILITY_TTL_SECONDS:
+        return cached[0]
+
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(Camera.algorithm_capability, Camera.algorithm_enabled).where(Camera.camera_id == camera_id)
+            )
+            row = result.first()
+            if not row:
+                return None
+            capability, enabled = row[0], row[1]
+            value = capability if enabled else "disabled"
+            _capability_cache[camera_id] = (value, now)
+            return value
+    except Exception:
+        logger.exception("查询摄像头算法能力失败 camera_id=%s", camera_id)
+        return None
+
+
+async def _get_camera_area(camera_id: Optional[str]) -> Optional[str]:
+    camera_id = _normalize_camera_id(camera_id)
+    if not camera_id:
+        return None
+
+    cached = _camera_area_cache.get(camera_id)
+    now = time.time()
+    if cached and now - cached[1] < _CAMERA_AREA_TTL_SECONDS:
+        return cached[0]
+
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(Camera.area2d_pt).where(Camera.camera_id == camera_id)
+            )
+            area = result.scalar_one_or_none()
+            if area:
+                _camera_area_cache[camera_id] = (area, now)
+            return area
+    except Exception:
+        logger.exception("查询摄像头区域失败 camera_id=%s", camera_id)
+        return None
 
 
 # ============================
 # 上传单文件到 MinIO
 # ============================
 async def handle_video(video_path: str, minio_service):
-    """上传文件到 MinIO，生成预签名 URL，并删除本地文件。"""
+    """上传单个视频到 MinIO，生成预签名 URL，并删除本地文件。"""
     rel_path = os.path.relpath(video_path, settings.LOCAL_VIDEO_PATH)
     object_name = f"videos/{rel_path.replace(os.sep, '/')}"
 
@@ -63,9 +138,7 @@ async def process_and_enqueue(
     semaphore: asyncio.Semaphore,
     redis_service,
 ):
-    """
-    生产阶段：上传到 MinIO → 删除本地文件 → 将 MinIO 信息入 Redis。
-    """
+    """上传文件并将 MinIO 元数据入队（生产者侧）。"""
     try:
         logger.info("🔥 即将处理文件 → %s", video_path)
 
@@ -76,11 +149,22 @@ async def process_and_enqueue(
             semaphore.release()
 
         clip_time = Path(upload_info["object_name"]).stem
+        camera_id = _extract_camera_id_from_path(upload_info["object_name"])
+        capability = await _get_camera_capability(camera_id)
+        area2d_pt = await _get_camera_area(camera_id)
+        if capability == "disabled":
+            logger.info("🚫 摄像头算法已停用，跳过入队 camera=%s file=%s", camera_id, video_path)
+            return
+        
+        #这里以后需要根据算法能力的不同决定哪些信息入队，目前仅有行为识别算法
         await redis_service.enqueue_minio_video(
             object_name=upload_info["object_name"],
             presigned_url=upload_info["presigned_url"],
             service_name=settings.BEHAVIOR_SERVICE_NAME,
             clip_time=clip_time,
+            camera_id=camera_id,
+            algorithm_capability=capability,
+            area2d_pt=area2d_pt,
         )
         logger.info("✅ 已将 MinIO 对象入队：%s", upload_info["object_name"])
 
@@ -197,10 +281,8 @@ class VideoHandler(FileSystemEventHandler):
 # ============================
 # Redis 队列消费者（手动启动）
 # ============================
-async def redis_consumer(redis_service, minio_service, behavior_service, event_processor=None):
-    """
-    使用调度器 + 多 worker 的方式消费 Redis 队列，避免单线程瓶颈。
-    """
+async def redis_consumer(redis_service, minio_service, behavior_service, event_processor=None, algorithm_registry=None):
+    """Redis 队列消费者：dispatcher + worker 池并发处理任务。"""
     logger.info("🚀 Redis 任务消费者已启动（dispatcher + worker pool）")
 
     task_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
@@ -216,6 +298,7 @@ async def redis_consumer(redis_service, minio_service, behavior_service, event_p
                         minio_service,
                         behavior_service,
                         event_processor,
+                        algorithm_registry,
                     )
                 finally:
                     task_queue.task_done()
@@ -264,7 +347,9 @@ async def _process_queue_task(
     minio_service,
     behavior_service,
     event_processor,
+    algorithm_registry,
 ):
+    """下载队列任务对应的对象并调用算法/后处理。"""
     object_name = task.get("object_name")
     presigned_url = task.get("presigned_url")
 
@@ -273,9 +358,21 @@ async def _process_queue_task(
         return
 
     logger.info("🛰️ worker-%s 消费 MinIO 任务：%s", worker_id, object_name)
-    camera_id = next((part for part in Path(object_name).parts if part.startswith("camera_")), None)
+    camera_id = task.get("camera_id") or next((part for part in Path(object_name).parts if part.startswith("camera_")), None)
     clip_time = task.get("clip_time")
     service_name = task.get("service_name")
+    capability = task.get("algorithm_capability")
+    # 总是查一次最新配置，避免入队后被停用仍然消费
+    if camera_id:
+        latest_cap = await _get_camera_capability(camera_id)
+        if latest_cap:
+            capability = latest_cap
+    if capability == "disabled":
+        logger.info("worker-%s 跳过算法处理（已停用） camera=%s object=%s", worker_id, camera_id, object_name)
+        return
+    area2d_pt = task.get("area2d_pt")
+    if not area2d_pt and camera_id:
+        area2d_pt = await _get_camera_area(camera_id)
 
     suffix = Path(object_name).suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -297,17 +394,36 @@ async def _process_queue_task(
 
     try:
         result = None
-        if behavior_service is not None:
-            result = await behavior_service.process_clip(
-                tmp_path,
-                camera_id=camera_id,
-                object_name=object_name,
-                clip_time=clip_time,
-                service_name=service_name,
-            )
-            if result.get("complete") and event_processor is not None:
-                await event_processor.process_event(result)
-                logger.info("事件后处理完成 camera=%s", result.get("camera_id"))
+        handler = behavior_service
+        if algorithm_registry is not None:
+            handler = algorithm_registry.get(capability, default=behavior_service)
+        task_ctx = AlgorithmTask(
+            video_path=tmp_path,
+            camera_id=camera_id,
+            object_name=object_name,
+            clip_time=clip_time,
+            service_name=service_name,
+            algorithm_capability=capability,
+            area2d_pt=area2d_pt,
+            extra=task,
+        )
+        if handler is not None:
+            if hasattr(handler, "handle"):
+                result = await handler.handle(task_ctx)
+            elif callable(getattr(handler, "process_clip", None)):
+                result = await handler.process_clip(
+                    tmp_path,
+                    camera_id=camera_id,
+                    object_name=object_name,
+                    clip_time=clip_time,
+                    service_name=service_name,
+                )
+            else:
+                logger.warning("handler 无法调用 capability=%s handler=%s", capability, handler)
+        # 只有行为识别流程才需要事件后处理；检查完成标记以保持兼容
+        if isinstance(result, dict) and result.get("complete") and event_processor is not None:
+            await event_processor.process_event(result)
+            logger.info("事件后处理完成 camera=%s", result.get("camera_id"))
     except Exception as proc_exc:
         logger.exception("行为识别失败 %s: %s", tmp_path, proc_exc)
     finally:
@@ -321,6 +437,7 @@ async def _process_queue_task(
 # 启动 Watchdog 监听（生产：上传+入队 MinIO 信息）
 # ============================
 async def start_watching(loop, minio_service, redis_service):
+    """启动 Watchdog 监听本地目录并上传入队。"""
     semaphore = asyncio.Semaphore(settings.UPLOAD_CONCURRENCY)
     handler = VideoHandler(loop, minio_service, redis_service, semaphore)
     observer = Observer()
@@ -336,7 +453,14 @@ async def start_watching(loop, minio_service, redis_service):
 # ============================
 # 手动启动消费者
 # ============================
-async def start_consumer(minio_service, behavior_service, redis_service, event_processor=None):
+async def start_consumer(minio_service, behavior_service, redis_service, event_processor=None, algorithm_registry=None):
+    """创建并启动 Redis 消费者任务。"""
     return asyncio.create_task(
-        redis_consumer(redis_service, minio_service, behavior_service, event_processor)
+        redis_consumer(
+            redis_service,
+            minio_service,
+            behavior_service,
+            event_processor,
+            algorithm_registry,
+        )
     )

@@ -12,6 +12,9 @@ class CameraBase(BaseModel):
 class CameraCreate(BaseModel):
     name: str
     rtsp_url: str
+    algorithm_capability: str
+    area2d_pt: str
+    algorithm_enabled: bool = True
 
     resolution: Optional[str] = "HD"
     codec: Optional[str] = "H264"
@@ -37,6 +40,9 @@ class CameraResponse(BaseModel):
     camera_id: str
     name: str
     rtsp_url: str
+    algorithm_capability: str
+    area2d_pt: str | None
+    algorithm_enabled: bool
     resolution: str | None
     codec: str | None
     fps: str | None

@@ -17,6 +17,9 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 标签归一化，用于匹配提枪/挂枪动作
+_LIFT_LABELS = {"提油枪"}
+_HANG_LABELS = {"挂油枪"}
 
 class EventPostProcessor:
     def __init__(self, minio_service, redis_client=None):
@@ -29,6 +32,12 @@ class EventPostProcessor:
         self.history_ttl = getattr(settings, "BEHAVIOR_FAILURE_TTL_SECONDS", 604800)
 
     async def process_event(self, event_result: Dict[str, Any]):
+        """
+        事件后处理入口：
+        - 下载切片并拼接成完整视频
+        - 截取首尾帧（提挂帧或异常帧），上传到帧桶
+        - 生成回调/历史所需的 URL 字段
+        """
         segments = event_result.get("segments") or []
         if not segments:
             return
@@ -47,13 +56,14 @@ class EventPostProcessor:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_attempts + 1):
             try:
-                video_object, video_url = await self._process_once(camera_id, start_time, end_time, segments)
+                video_object, video_url, frames = await self._process_once(
+                    camera_id, start_time, end_time, segments, reason
+                )
                 await self._record_success(
                     camera_id=camera_id,
                     reason=reason,
-                    segments=segments,
-                    video_object=video_object,
                     video_url=video_url,
+                    frames=frames,
                 )
                 return
             except Exception as exc:
@@ -75,7 +85,11 @@ class EventPostProcessor:
         start_time: Optional[str],
         end_time: Optional[str],
         segments: List[Dict[str, Any]],
+        reason: str,
     ):
+        """
+        单次后处理：下载→拼接→截帧→上传视频与帧。
+        """
         tmp_dir = tempfile.mkdtemp(prefix="behavior-event-")
         try:
             local_files = await self._download_segments(segments, tmp_dir)
@@ -86,6 +100,8 @@ class EventPostProcessor:
             await self._concat_videos(local_files, output_path)
             logger.debug("事件后处理：拼接输出 %s", output_path)
             video_object, video_url = await self._upload_event_video(camera_id, output_path)
+            seg_files = list(zip(segments, local_files))
+            frames = await self._extract_and_upload_frames(camera_id, seg_files, reason=reason)
             await self._save_event_record(
                 camera_id=camera_id,
                 start_clip_time=start_time,
@@ -94,7 +110,7 @@ class EventPostProcessor:
                 video_url=video_url,
                 segments=segments,
             )
-            return video_object, video_url
+            return video_object, video_url, frames
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -197,6 +213,122 @@ class EventPostProcessor:
         )
         return object_name, presigned_url
 
+    async def _extract_and_upload_frames(self, camera_id: str, seg_files: List[tuple], reason: str):
+        """
+        按动作时间截帧：
+        - 提枪帧：提枪动作的 start/end_time
+        - 挂枪帧：挂枪动作的 start/end_time
+        - 若缺失对应动作则对应帧留空字符串
+        """
+        if not seg_files:
+            return {
+                "start_lift_frame_url": "",
+                "end_lift_frame_url": "",
+                "start_hang_frame_url": "",
+                "end_hang_frame_url": "",
+            }
+
+        lift_start = lift_end = hang_start = hang_end = None  # (file_path, seconds)
+        for seg, file_path in seg_files:
+            actions = seg.get("actions") or []
+            for act in actions:
+                label = (act.get("label_name") or "").strip().lower()
+                if label in _LIFT_LABELS:
+                    if lift_start is None:
+                        lift_start = (file_path, float(act.get("start_time", 0)))
+                    lift_end = (file_path, float(act.get("end_time", 0)))
+                if label in _HANG_LABELS:
+                    if hang_start is None:
+                        hang_start = (file_path, float(act.get("start_time", 0)))
+                    hang_end = (file_path, float(act.get("end_time", 0)))
+
+        tmp_start = Path(tempfile.mkstemp(prefix="frame-start-", suffix=".jpg")[1])
+        tmp_end = Path(tempfile.mkstemp(prefix="frame-end-", suffix=".jpg")[1])
+
+        try:
+            lift_start_url = ""
+            lift_end_url = ""
+            hang_start_url = ""
+            hang_end_url = ""
+
+            if lift_start:
+                await self._extract_frame_at(lift_start[0], tmp_start, lift_start[1])
+                lift_start_url = await self._upload_frame(camera_id, tmp_start, "lift_start")
+            if lift_end:
+                await self._extract_frame_at(lift_end[0], tmp_end, lift_end[1])
+                lift_end_url = await self._upload_frame(camera_id, tmp_end, "lift_end")
+
+            if hang_start and reason != "lift_only":
+                await self._extract_frame_at(hang_start[0], tmp_start, hang_start[1])
+                hang_start_url = await self._upload_frame(camera_id, tmp_start, "hang_start")
+            if hang_end and reason != "lift_only":
+                await self._extract_frame_at(hang_end[0], tmp_end, hang_end[1])
+                hang_end_url = await self._upload_frame(camera_id, tmp_end, "hang_end")
+
+            return {
+                "start_lift_frame_url": lift_start_url,
+                "end_lift_frame_url": lift_end_url,
+                "start_hang_frame_url": hang_start_url,
+                "end_hang_frame_url": hang_end_url,
+            }
+        finally:
+            for p in (tmp_start, tmp_end):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    async def _extract_frame(self, src: str, dst: Path, last: bool = False):
+        # 兼容原接口，保留但不再使用 last 分支
+        await self._extract_frame_at(src, dst, 0 if not last else None)
+
+    async def _extract_frame_at(self, src: str, dst: Path, seconds: Optional[float]):
+        # 精确到时间点取帧，若 seconds 为 None 则取末尾 0.5 秒
+        args = ["ffmpeg", "-y"]
+        if seconds is None:
+            args += ["-sseof", "-0.5"]
+        else:
+            args += ["-ss", str(max(0, seconds))]
+        args += ["-i", src, "-vframes", "1", "-q:v", "2", str(dst)]
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                "截帧失败 src=%s seconds=%s code=%s stderr=%s",
+                src,
+                seconds,
+                proc.returncode,
+                stderr.decode(errors="ignore"),
+            )
+            raise RuntimeError("extract frame failed")
+
+    async def _upload_frame(self, camera_id: str, file_path: Path, kind: str):
+        object_name = f"frames/{camera_id}/{int(time.time())}_{kind}.jpg"
+        await asyncio.to_thread(
+            self.minio_service.upload_file,
+            settings.BEHAVIOR_EVENT_FRAME_BUCKET,
+            object_name,
+            str(file_path),
+            content_type="image/jpeg",
+        )
+        expires = settings.BEHAVIOR_EVENT_FRAME_URL_EXPIRE
+        if isinstance(expires, (int, float)):
+            from datetime import timedelta
+
+            expires = timedelta(seconds=int(expires))
+
+        presigned_url = await asyncio.to_thread(
+            self.minio_service.client.presigned_get_object,
+            settings.BEHAVIOR_EVENT_FRAME_BUCKET,
+            object_name,
+            expires=expires,
+        )
+        return presigned_url
+
     async def _save_event_record(
         self,
         *,
@@ -241,7 +373,7 @@ class EventPostProcessor:
             logger.error("事件后处理失败，未写入失败队列：%s", data)
             return
         try:
-            redis_key = self._history_key(status)
+            redis_key = self._history_key(status, camera_id=event_result.get("camera_id"))
             await self.redis_client.lpush(redis_key, data)
             await self.redis_client.expire(redis_key, self.history_ttl)
             logger.error(
@@ -257,17 +389,21 @@ class EventPostProcessor:
         *,
         camera_id: str,
         reason: str,
-        segments: List[Dict[str, Any]],
-        video_object: str,
         video_url: str,
+        frames: Dict[str, Optional[str]],
     ):
-        await self._record_history(camera_id, "complete", reason, segments, video_object, video_url)
+        await self._record_history(
+            camera_id,
+            "complete",
+            reason,
+            video_url,
+            frames,
+        )
         notify_ok = await self._notify_complete_event(
             camera_id,
             reason,
-            segments,
-            video_object,
             video_url,
+            frames,
         )
         if not notify_ok:
             logger.warning(
@@ -281,9 +417,8 @@ class EventPostProcessor:
         camera_id: str,
         status: str,
         reason: str,
-        segments: List[Dict[str, Any]],
-        video_object: str,
         video_url: str,
+        frames: Dict[str, Optional[str]],
     ):
         if not self.redis_client:
             return
@@ -291,14 +426,16 @@ class EventPostProcessor:
             "camera_id": camera_id,
             "status": status,
             "reason": reason,
-            "segments": segments,
-            "video_object": video_object,
             "video_url": video_url,
+            "start_lift_frame_url": frames.get("start_lift_frame_url") or "",
+            "end_lift_frame_url": frames.get("end_lift_frame_url") or "",
+            "start_hang_frame_url": frames.get("start_hang_frame_url") or "",
+            "end_hang_frame_url": frames.get("end_hang_frame_url") or "",
             "timestamp": time.time(),
         }
         data = json.dumps(payload, ensure_ascii=False, default=str)
         try:
-            redis_key = self._history_key(status)
+            redis_key = self._history_key(status, camera_id=camera_id)
             await self.redis_client.lpush(redis_key, data)
             await self.redis_client.expire(redis_key, self.history_ttl)
             logger.info("事件历史已记录 camera=%s status=%s redis_key=%s", camera_id, status, redis_key)
@@ -309,9 +446,8 @@ class EventPostProcessor:
         self,
         camera_id: str,
         reason: str,
-        segments: List[Dict[str, Any]],
-        video_object: str,
         video_url: str,
+        frames: Dict[str, Optional[str]],
     ) -> bool:
         notify_url = settings.BEHAVIOR_EVENT_NOTIFY_URL
         if not notify_url:
@@ -319,9 +455,11 @@ class EventPostProcessor:
         payload = {
             "camera_id": camera_id,
             "reason": reason,
-            "video_object": video_object,
             "video_url": video_url,
-            "segments": segments,
+            "start_lift_frame_url": frames.get("start_lift_frame_url") or "",
+            "end_lift_frame_url": frames.get("end_lift_frame_url") or "",
+            "start_hang_frame_url": frames.get("start_hang_frame_url") or "",
+            "end_hang_frame_url": frames.get("end_hang_frame_url") or "",
         }
         last_exc: Optional[Exception] = None
         for attempt in range(1, settings.BEHAVIOR_EVENT_MAX_RETRIES + 1):
@@ -340,11 +478,19 @@ class EventPostProcessor:
                     exc,
                 )
                 await asyncio.sleep(self.retry_backoff * attempt)
-        await self._record_history(camera_id, "notify_failed", reason, segments, video_object, video_url)
+        await self._record_history(
+            camera_id,
+            "notify_failed",
+            reason,
+            video_url,
+            frames,
+        )
         if last_exc:
             logger.error("事件通知彻底失败 camera=%s error=%s", camera_id, last_exc)
         return False
 
-    def _history_key(self, status: str) -> str:
+    def _history_key(self, status: str, camera_id: Optional[str] = None) -> str:
         prefix = self.history_key_prefix or settings.BEHAVIOR_EVENT_FAILURE_QUEUE
+        if getattr(settings, "BEHAVIOR_HISTORY_PER_CAMERA", False) and camera_id:
+            return f"{prefix}:{status}:{camera_id}"
         return f"{prefix}:{status}"

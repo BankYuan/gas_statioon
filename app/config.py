@@ -4,6 +4,12 @@ from typing import Optional
 from pydantic_settings import BaseSettings  # Pydantic Settings 统一配置入口
 
 class Settings(BaseSettings):
+    LICENSE_PATH: str = "./license.json"
+    LICENSE_CURRENT_IMAGE_ID: str = ""  # 当前运行镜像标识（通过 .env 注入；为空则仅依赖 license 内的 image_id）
+    LICENSE_EXPECTED_CONTAINER_ID: str = ""  # 可选：预期容器 ID（如无需校验可留空）
+    CLEANUP_MAX_AGE_HOURS: int = 24  # 本地切片清理阈值（小时）
+    API_TOKEN: str = "d017965da5c68ae134d7f113b68e6353"
+
     # ==== ZLMediaKit（拉流/切片） ====
     ZLM_API_BASE: str = "http://127.0.0.1:8080/index/api"
     ZLM_SECRET: str = "J2Gbvg3593Wj3lMDYmXG4xZLlUni16FM"
@@ -19,7 +25,7 @@ class Settings(BaseSettings):
     LOCAL_VIDEO_PATH: str = "/mnt/data1/Gas_station_video/mp4"
     EXPIRE_DAY: int = 1   # 259200 秒
     UPLOAD_CONCURRENCY: int = 4  # Watchdog 上传/消费者并发
-    LOG_LEVEL: str = "DEBUG"  # 默认日志级别
+    LOG_LEVEL: str = "INFO"  # 默认日志级别
 
     # ==== 数据库 ====
     DATABASE_URL: str = "postgresql+asyncpg://video_user:123456@127.0.0.1:15432/video_db"
@@ -36,6 +42,16 @@ class Settings(BaseSettings):
     BEHAVIOR_EVENT_BUCKET: str = "camera-event-video"  # 拼接结果存放的 MinIO 桶
     BEHAVIOR_EVENT_PREFIX: str = "events"  # 事件视频对象前缀
     BEHAVIOR_EVENT_URL_EXPIRE: int = 86400  # 事件视频预签名 URL 的有效期（秒）
+    BEHAVIOR_EVENT_FRAME_BUCKET: str = "camera-event-frames"  # 开始/结束帧存放桶
+    BEHAVIOR_EVENT_FRAME_URL_EXPIRE: int = 86400  # 帧图预签名 URL 有效期（秒）
+    # 事件分类开关与阈值（默认切片 60s 场景）
+    BEHAVIOR_ENABLE_LIFT_ONLY: bool = True       # 提枪未挂枪是否输出事件
+    BEHAVIOR_ENABLE_SHORT_HANG: bool = True      # 短时挂枪是否输出事件
+    BEHAVIOR_ENABLE_HANG_ONLY: bool = True       # 未提枪直接挂枪是否输出事件
+    BEHAVIOR_MAX_WAIT_SECONDS: int = 180         # 提枪后最长等待挂枪时长（秒），超时视为异常中断
+    BEHAVIOR_SHORT_HANG_THRESHOLD_SECONDS: int = 5  # 提挂总时长低于此阈值视为误操作（短时挂枪）
+    BEHAVIOR_HANG_ONLY_BACKTRACK_SEGMENTS: int = 5  # 挂枪异常时回溯的前置切片数（含当前最多 5 段）
+    BEHAVIOR_HISTORY_PER_CAMERA: bool = True     # 历史/失败记录按摄像头分 key，便于大规模场景隔离
     BEHAVIOR_EVENT_MAX_RETRIES: int = 3  # 事件后处理（拼接/上传/入库）重试次数
     BEHAVIOR_EVENT_RETRY_BACKOFF: float = 2.0  # 后处理失败后退避基数
     BEHAVIOR_EVENT_DOWNLOAD_RETRIES: int = 3  # 下载单个切片的重试次数
@@ -47,7 +63,7 @@ class Settings(BaseSettings):
 
     # ==== Redis 任务队列 ====
     REDIS_URL: str = "redis://127.0.0.1:6378/0"
-    REDIS_QUEUE_NAME: str = "video_tasks"
+    REDIS_QUEUE_NAME: str = "video_tasks"  # 默认队列名前缀，按摄像头拆分时将附加 camera_id
     REDIS_POP_TIMEOUT: int = 5
 
     class Config:

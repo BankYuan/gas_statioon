@@ -17,6 +17,9 @@ class Camera(Base):
     resolution = Column(String(20), default="HD")   # 分辨率：HD / SD / 1080P / 720P
     codec = Column(String(20), default="H264")      # H264 / H265
     fps = Column(String(20), default=25)               # 帧率
+    algorithm_capability = Column(String(100), nullable=False, default="unknown")  # 算法能力标签，创建摄像头时必填
+    area2d_pt = Column(String(2000), nullable=True)   # 行为识别区域点位配置（字符串/JSON）
+    algorithm_enabled = Column(Boolean, default=True)  # 是否启用算法服务
 
     # --- 是否正在拉流 ---
     is_pulled = Column(Boolean, default=False)      # 是否已成功 addStreamProxy

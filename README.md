@@ -114,6 +114,8 @@ python scripts/consumer_worker.py
 - **检查生命周期配置**：`python scripts/minio_lifecycleconfig.py`
 - **监控 Redis 队列长度**：`redis-cli -h 127.0.0.1 -p 6378 LLEN video_tasks`
 - **下载事件视频**：`mc cp local/camera-event-video/events/<camera>/<ts>.mp4 ./`
+- **清理本地积压切片**：`python scripts/cleanup_local_videos.py`（默认删除超过 24 小时的切片；可用 `--max-age-hours` 自定义，配合 `--dry-run` 排查）
+- **crontab 示例**：在 Linux 上执行 `crontab -e`，加入 `0 * * * * /usr/bin/python /mnt/data1/gas_station_fastapi/scripts/cleanup_local_videos.py >> /var/log/cleanup.log 2>&1`，即可每小时自动清理一次；如需改阈值可在命令后加 `--max-age-hours 12`
 
 ### 7.2 摄像头管理（FastAPI）
 | 目的 | 命令 | 说明 / 输出示例 |

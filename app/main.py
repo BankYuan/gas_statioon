@@ -1,4 +1,6 @@
 import asyncio
+import sys
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers.camera_api import router as camera_router
@@ -10,8 +12,15 @@ from app.service.zlm_service import ZLMService
 from app.service.camera_service import CameraService
 from app.service.behavior_service import BehaviorService
 from app.service.redis_queue_service import RedisQueueService
+from app.service.algorithm_registry import AlgorithmRegistry
 from app.utils.logger import init_logging, get_logger
 from app.config import settings as _settings
+from verify_license import verify_license
+from app.utils.license_guard import LicenseGuard
+
+runtime_dir = Path(__file__).resolve().parent.parent / "pyarmor_runtime_000000"
+if runtime_dir.exists() and str(runtime_dir) not in sys.path:
+    sys.path.insert(0, str(runtime_dir))
 
 app_ = FastAPI(title="Video Platform Service", version="1.0.0")
 
@@ -33,6 +42,11 @@ app_.include_router(record_router, prefix="/record", tags=["Record"])
 async def root():
     return {"message": "Video Platform API is running!"}
 
+def _ensure_license():
+    valid, message = verify_license(_settings.LICENSE_PATH)
+    if not valid:
+        raise RuntimeError(f"License verification failed: {message}")
+
 
 @app_.on_event("startup")
 async def startup_event():
@@ -40,6 +54,7 @@ async def startup_event():
     # 初始化日志（尽早）
     init_logging(_settings.LOG_LEVEL)
     logger = get_logger(__name__)
+    _ensure_license()
 
     # 创建并初始化单例服务（MinIO、ZLM、CameraService）
     app_.state.minio_service = MinioService()
@@ -51,8 +66,15 @@ async def startup_event():
     app_.state.redis_service = RedisQueueService()
     await app_.state.redis_service.init()
     app_.state.behavior_service = BehaviorService(redis_client=app_.state.redis_service.client)
+    registry = AlgorithmRegistry()
+    registry.register("behavior", app_.state.behavior_service)
+    registry.register("default", app_.state.behavior_service)
+    app_.state.algorithm_registry = registry
 
     logger.info("Services initialized, starting file watcher")
+    guard = LicenseGuard(interval_seconds=3600)
+    await guard.start()
+    app_.state.license_guard = guard
 
     # 启动视频目录监听（生产：上传到 MinIO 并入队 MinIO 信息）
     observer = await start_watching(
@@ -72,6 +94,9 @@ async def shutdown_event():
     redis_service = getattr(app_.state, "redis_service", None)
 
     logger.info("🛑 停止 Watchdog 监听...")
+    guard = getattr(app_.state, "license_guard", None)
+    if guard:
+        await guard.stop()
     if observer:
         observer.stop()
         observer.join()   # 等待线程退出
@@ -86,4 +111,3 @@ async def shutdown_event():
 
     if redis_service:
         await redis_service.close()
-
