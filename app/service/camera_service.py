@@ -75,9 +75,8 @@ class CameraService:
 
         # ---------- 1. ZLM 无流 → 清空数据库 ----------
         if not zlm_keys:
-            await db.execute(delete(Camera))
-            await db.commit()
-            return {"action": "cleared", "reason": "ZLM has no streams"}
+            # 安全策略：不自动清空，以免误删。返回提示由上层决策。
+            return {"action": "noop", "reason": "ZLM has no streams"}
 
         # ---------- 2. 新增缺少的摄像头 ----------
         missing = zlm_keys - db_keys
@@ -91,6 +90,12 @@ class CameraService:
                 continue
 
             origin_rtsp = media.get("originUrl") or ""  # ZLM 返回原始 RTSP
+            # 若已有同 camera_id 的记录，做更新而非重复插入
+            existing = next((c for c in db_cameras if c.camera_id == stream.replace("camera_", "")), None)
+            if existing:
+                existing.rtsp_url = origin_rtsp or existing.rtsp_url
+                db.add(existing)
+                continue
 
             # 从 stream 提取真正的 camera_id
             # stream 格式是 camera_51018500451327700007
@@ -122,8 +127,9 @@ class CameraService:
         # ---------- 3. 删除多余的摄像头 ----------
         extra = db_keys - zlm_keys
         if extra:
-            for key in extra:
-                app, stream = key.split("/")
+            # 批量删除多余的摄像头
+            app_stream_pairs = [tuple(key.split("/")) for key in extra]
+            for app, stream in app_stream_pairs:
                 await db.execute(
                     delete(Camera)
                     .where(Camera.app == app)

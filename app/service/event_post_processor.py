@@ -6,7 +6,8 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
 
 import httpx
 
@@ -20,6 +21,16 @@ logger = get_logger(__name__)
 # 标签归一化，用于匹配提枪/挂枪动作
 _LIFT_LABELS = {"提油枪"}
 _HANG_LABELS = {"挂油枪"}
+_LIFT_LABELS_NORM = {lbl.strip().lower() for lbl in _LIFT_LABELS}
+_HANG_LABELS_NORM = {lbl.strip().lower() for lbl in _HANG_LABELS}
+
+
+@dataclass
+class ProcessResult:
+    """事件后处理结果封装，便于统一传递。"""
+    video_object: str
+    video_url: str
+    frames: Dict[str, Optional[str]]
 
 class EventPostProcessor:
     def __init__(self, minio_service, redis_client=None):
@@ -56,14 +67,13 @@ class EventPostProcessor:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_attempts + 1):
             try:
-                video_object, video_url, frames = await self._process_once(
+                result = await self._process_once(
                     camera_id, start_time, end_time, segments, reason
                 )
                 await self._record_success(
                     camera_id=camera_id,
                     reason=reason,
-                    video_url=video_url,
-                    frames=frames,
+                    result=result,
                 )
                 return
             except Exception as exc:
@@ -86,7 +96,7 @@ class EventPostProcessor:
         end_time: Optional[str],
         segments: List[Dict[str, Any]],
         reason: str,
-    ):
+    ) -> ProcessResult:
         """
         单次后处理：下载→拼接→截帧→上传视频与帧。
         """
@@ -100,8 +110,13 @@ class EventPostProcessor:
             await self._concat_videos(local_files, output_path)
             logger.debug("事件后处理：拼接输出 %s", output_path)
             video_object, video_url = await self._upload_event_video(camera_id, output_path)
-            seg_files = list(zip(segments, local_files))
-            frames = await self._extract_and_upload_frames(camera_id, seg_files, reason=reason)
+            segment_files = list(zip(segments, local_files))
+            frames = await self._extract_and_upload_frames(
+                camera_id,
+                segment_files,
+                reason=reason,
+                tmp_dir=tmp_dir,
+            )
             await self._save_event_record(
                 camera_id=camera_id,
                 start_clip_time=start_time,
@@ -110,7 +125,7 @@ class EventPostProcessor:
                 video_url=video_url,
                 segments=segments,
             )
-            return video_object, video_url, frames
+            return ProcessResult(video_object=video_object, video_url=video_url, frames=frames)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -150,6 +165,25 @@ class EventPostProcessor:
         raise RuntimeError(f"download segment failed: {object_name}") from last_exc
 
     async def _concat_videos(self, files: List[str], output_path: str):
+        """ffmpeg concat 包装，失败按退避重试。"""
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                await self._concat_videos_once(files, output_path)
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "事件拼接失败 attempt=%s/%s error=%s",
+                    attempt,
+                    self.max_attempts,
+                    exc,
+                )
+                if attempt < self.max_attempts:
+                    await asyncio.sleep(self.retry_backoff * attempt)
+        raise RuntimeError(f"ffmpeg concat failed after retries: {output_path}") from last_exc
+
+    async def _concat_videos_once(self, files: List[str], output_path: str):
         if len(files) == 1:
             shutil.copy2(files[0], output_path)
             return
@@ -169,6 +203,8 @@ class EventPostProcessor:
             list_file,
             "-c",
             "copy",
+            "-loglevel",
+            "error",
             output_path,
         ]
 
@@ -177,7 +213,13 @@ class EventPostProcessor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            logger.warning("ffmpeg concat 超时，被强制终止 output=%s", output_path)
+            raise RuntimeError("ffmpeg concat timeout")
         if proc.returncode != 0:
             logger.error(
                 "事件拼接失败 code=%s stdout=%s stderr=%s",
@@ -213,14 +255,14 @@ class EventPostProcessor:
         )
         return object_name, presigned_url
 
-    async def _extract_and_upload_frames(self, camera_id: str, seg_files: List[tuple], reason: str):
+    async def _extract_and_upload_frames(self, camera_id: str, segment_files: List[Tuple[Dict[str, Any], str]], reason: str, tmp_dir: str):
         """
         按动作时间截帧：
         - 提枪帧：提枪动作的 start/end_time
         - 挂枪帧：挂枪动作的 start/end_time
         - 若缺失对应动作则对应帧留空字符串
         """
-        if not seg_files:
+        if not segment_files:
             return {
                 "start_lift_frame_url": "",
                 "end_lift_frame_url": "",
@@ -228,55 +270,97 @@ class EventPostProcessor:
                 "end_hang_frame_url": "",
             }
 
-        lift_start = lift_end = hang_start = hang_end = None  # (file_path, seconds)
-        for seg, file_path in seg_files:
-            actions = seg.get("actions") or []
+        times = self._collect_action_times(segment_files)
+        lift_frames = await self._extract_lift_frames(camera_id, times, tmp_dir)
+        hang_frames = await self._extract_hang_frames(camera_id, times, reason, tmp_dir)
+        return {**lift_frames, **hang_frames}
+
+    @classmethod
+    def _collect_action_times(cls, segment_files: List[Tuple[Dict[str, Any], str]]) -> Dict[str, Optional[Tuple[str, float]]]:
+        """提取提/挂枪动作对应的 (文件, 时间戳) 元组。"""
+        lift_start = lift_end = hang_start = hang_end = None
+        for segment, file_path in segment_files:
+            actions = segment.get("actions") or []
             for act in actions:
-                label = (act.get("label_name") or "").strip().lower()
-                if label in _LIFT_LABELS:
+                label = cls._normalize_label(act.get("label_name"))
+                if label in _LIFT_LABELS_NORM:
                     if lift_start is None:
                         lift_start = (file_path, float(act.get("start_time", 0)))
                     lift_end = (file_path, float(act.get("end_time", 0)))
-                if label in _HANG_LABELS:
+                if label in _HANG_LABELS_NORM:
                     if hang_start is None:
                         hang_start = (file_path, float(act.get("start_time", 0)))
                     hang_end = (file_path, float(act.get("end_time", 0)))
+        return {
+            "lift_start": lift_start,
+            "lift_end": lift_end,
+            "hang_start": hang_start,
+            "hang_end": hang_end,
+        }
 
-        tmp_start = Path(tempfile.mkstemp(prefix="frame-start-", suffix=".jpg")[1])
-        tmp_end = Path(tempfile.mkstemp(prefix="frame-end-", suffix=".jpg")[1])
+    async def _extract_lift_frames(self, camera_id: str, times: Dict[str, Optional[Tuple[str, float]]], tmp_dir: str) -> Dict[str, str]:
+        """截取提枪开始/结束帧。"""
+        urls = {"start_lift_frame_url": "", "end_lift_frame_url": ""}
+        if times.get("lift_start"):
+            urls["start_lift_frame_url"] = await self._extract_frame_with_retry(
+                camera_id, times["lift_start"], "lift_start", tmp_dir
+            )
+        if times.get("lift_end"):
+            urls["end_lift_frame_url"] = await self._extract_frame_with_retry(
+                camera_id, times["lift_end"], "lift_end", tmp_dir
+            )
+        return urls
 
-        try:
-            lift_start_url = ""
-            lift_end_url = ""
-            hang_start_url = ""
-            hang_end_url = ""
+    async def _extract_hang_frames(self, camera_id: str, times: Dict[str, Optional[Tuple[str, float]]], reason: str, tmp_dir: str) -> Dict[str, str]:
+        """截取挂枪开始/结束帧（lift_only 场景跳过）。"""
+        urls = {"start_hang_frame_url": "", "end_hang_frame_url": ""}
+        if reason == "lift_only":
+            return urls
+        if times.get("hang_start"):
+            urls["start_hang_frame_url"] = await self._extract_frame_with_retry(
+                camera_id, times["hang_start"], "hang_start", tmp_dir
+            )
+        if times.get("hang_end"):
+            urls["end_hang_frame_url"] = await self._extract_frame_with_retry(
+                camera_id, times["hang_end"], "hang_end", tmp_dir
+            )
+        return urls
 
-            if lift_start:
-                await self._extract_frame_at(lift_start[0], tmp_start, lift_start[1])
-                lift_start_url = await self._upload_frame(camera_id, tmp_start, "lift_start")
-            if lift_end:
-                await self._extract_frame_at(lift_end[0], tmp_end, lift_end[1])
-                lift_end_url = await self._upload_frame(camera_id, tmp_end, "lift_end")
-
-            if hang_start and reason != "lift_only":
-                await self._extract_frame_at(hang_start[0], tmp_start, hang_start[1])
-                hang_start_url = await self._upload_frame(camera_id, tmp_start, "hang_start")
-            if hang_end and reason != "lift_only":
-                await self._extract_frame_at(hang_end[0], tmp_end, hang_end[1])
-                hang_end_url = await self._upload_frame(camera_id, tmp_end, "hang_end")
-
-            return {
-                "start_lift_frame_url": lift_start_url,
-                "end_lift_frame_url": lift_end_url,
-                "start_hang_frame_url": hang_start_url,
-                "end_hang_frame_url": hang_end_url,
-            }
-        finally:
-            for p in (tmp_start, tmp_end):
+    async def _extract_frame_with_retry(
+        self,
+        camera_id: str,
+        frame_info: Tuple[str, float],
+        kind: str,
+        tmp_dir: str,
+    ) -> str:
+        """为单个帧创建独立临时文件并带重试截帧+上传。"""
+        src, seconds = frame_info
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_attempts + 1):
+            with tempfile.NamedTemporaryFile(prefix=f"{kind}-", suffix=".jpg", dir=tmp_dir, delete=False) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+            try:
+                await self._extract_frame_at(src, tmp_path, seconds)
+                return await self._upload_frame(camera_id, tmp_path, kind)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "截帧失败 attempt=%s/%s kind=%s src=%s seconds=%s error=%s",
+                    attempt,
+                    self.max_attempts,
+                    kind,
+                    src,
+                    seconds,
+                    exc,
+                )
+                if attempt < self.max_attempts:
+                    await asyncio.sleep(self.retry_backoff * attempt)
+            finally:
                 try:
-                    os.remove(p)
+                    os.remove(tmp_path)
                 except OSError:
                     pass
+        raise RuntimeError(f"extract frame failed after retries kind={kind} src={src}") from last_exc
 
     async def _extract_frame(self, src: str, dst: Path, last: bool = False):
         # 兼容原接口，保留但不再使用 last 分支
@@ -295,7 +379,13 @@ class EventPostProcessor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            logger.warning("ffmpeg 截帧超时，被强制终止 src=%s seconds=%s", src, seconds)
+            raise RuntimeError("extract frame timeout")
         if proc.returncode != 0:
             logger.warning(
                 "截帧失败 src=%s seconds=%s code=%s stderr=%s",
@@ -389,27 +479,26 @@ class EventPostProcessor:
         *,
         camera_id: str,
         reason: str,
-        video_url: str,
-        frames: Dict[str, Optional[str]],
+        result: ProcessResult,
     ):
         await self._record_history(
             camera_id,
             "complete",
             reason,
-            video_url,
-            frames,
+            result.video_url,
+            result.frames,
         )
         notify_ok = await self._notify_complete_event(
             camera_id,
             reason,
-            video_url,
-            frames,
+            result.video_url,
+            result.frames,
         )
         if not notify_ok:
             logger.warning(
                 "事件通知仍失败 camera=%s video=%s，已记录 notify_failed",
                 camera_id,
-                video_object,
+                result.video_object,
             )
 
     async def _record_history(
@@ -465,8 +554,9 @@ class EventPostProcessor:
         for attempt in range(1, settings.BEHAVIOR_EVENT_MAX_RETRIES + 1):
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(notify_url, json=payload)
-                logger.info("事件通知已发送 camera=%s attempt=%s", camera_id, attempt)
+                    resp = await client.post(notify_url, json=payload)
+                    resp.raise_for_status()
+                logger.info("事件通知已发送 camera=%s attempt=%s status=%s", camera_id, attempt, resp.status_code)
                 return True
             except Exception as exc:
                 last_exc = exc
@@ -494,3 +584,7 @@ class EventPostProcessor:
         if getattr(settings, "BEHAVIOR_HISTORY_PER_CAMERA", False) and camera_id:
             return f"{prefix}:{status}:{camera_id}"
         return f"{prefix}:{status}"
+
+    @staticmethod
+    def _normalize_label(label: Optional[str]) -> str:
+        return (label or "").strip().lower()
